@@ -1,0 +1,54 @@
+models:
+  CNN:
+    input_shape: [32, 32, 3]
+    num_classes: 10
+    conv_layers:
+      - filters: 32
+        kernel_size: [3, 3]
+        activation: 'relu'
+      - filters: 64
+        kernel_size: [3, 3]
+        activation: 'relu'
+    batch_norm: true
+    dropout_rate: 0.25
+    dense_layers:
+      - units: 128
+        activation: 'relu'
+    final_activation: 'softmax'
+
+  VisionTransformer:
+    input_shape: [32, 32, 3]
+    num_classes: 10
+    patch_size: [4, 4]
+    num_patches: 64
+    projection_dim: 64
+    transformer_layers:
+      - num_heads: 4
+        mlp_units: [128, 64]
+        dropout_rate: 0.1
+    dense_units: 128
+    dropout_rate: 0.1
+    final_activation: 'softmax'
+
+  MLP:
+    input_shape: [32, 32, 3]
+    num_classes: 10
+    flatten: true
+    dense_layers:
+      - units: 128
+        activation: 'relu'
+      - units: 64
+        activation: 'relu'
+    dropout_rate: 0.25
+    final_activation: 'softmax'
+    
+training:
+  epochs: 50
+  batch_size: 32
+  optimizer: 'adam'
+  learning_rate: 0.001
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+
+callbacks: {}
