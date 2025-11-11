@@ -1,9 +1,9 @@
 # Training with Domain Adaptation Metrics
 
-Training pipeline for evaluating domain shift between synthetic and real image datasets. The goal is to identify metrics that can guide optimal mixing ratios when combining synthetic (source) and real (target) data within training batches.
+Training pipeline for evaluating domain shift between synthetic and real image datasets. The goal is to identify metrics that can guide optimal mixing ratios when combining synthetic (source) and real (target) data within training batches. Currently, the focus is on metrics that estimate the current progress or status of the training process.
 
 ## Status
-🚧 Work in progress - actively developing metric evaluation framework
+✅ **Ready to Use** - All core components implemented and functional
 
 ## Overview
 
@@ -17,12 +17,27 @@ These metrics will eventually inform a dynamic batch composition strategy.
 
 ## Quick Start
 
+### Installation
+
 ```bash
+# Install dependencies
 pip install -r requirements.txt
+```
+
+### Running Training
+
+```bash
+# Update DATA_ROOT_DIR in main.py to point to your dataset
 python main.py
 ```
 
-Make sure to update `DATA_ROOT_DIR` in `main.py` to point to your dataset.
+### Enable Domain Adaptation Tracking
+
+Edit `config.yaml` and set:
+```yaml
+domain_adaptation:
+  enabled: true  # Change from false to true
+```
 
 ## Project Structure
 
@@ -69,13 +84,33 @@ Logs are written to:
 Expected format:
 ```
 data/
-├── dataset/
-│   ├── FAKE/*.jpg
-│   └── REAL/*.jpg
-
+├── REAL/
+│   ├── 0/*.jpg  (or class_0, label_0, etc.)
+│   ├── 1/*.jpg
+│   ├── 2/*.jpg
+│   ├── ...
+│   └── 9/*.jpg
+└── FAKE/
+    ├── 0/*.jpg
+    ├── 1/*.jpg
+    ├── 2/*.jpg
+    ├── ...
+    └── 9/*.jpg
 ```
 
-Filenames should contain class labels (extracted via regex).
+- Each image type (REAL/FAKE) has subdirectories for each class
+- Class labels are automatically inferred from subdirectory names using TensorFlow's `image_dataset_from_directory`
+- Subdirectories are sorted alphanumerically to determine class indices
+- Supports any valid folder names (e.g., `0`, `class_0`, `label_0`) - labels are inferred from sort order
+
+### DataLoader Features
+
+The DataLoader now uses **TensorFlow's best practices**:
+- ✅ Built-in `image_dataset_from_directory` API (faster, simpler, more reliable)
+- ✅ Automatic label inference from directory structure
+- ✅ Efficient batching and prefetching with `tf.data.AUTOTUNE`
+- ✅ Proper caching and shuffling for optimal performance
+- ✅ Reproducible dataset splits with seed control
 
 ## Callbacks
 
@@ -114,15 +149,5 @@ Determining which metrics are most predictive of:
 
 ## Notes
 
-- Models currently trained on one domain only
-- Source domain held-out for metric computation
 - Batch mixing strategy not yet implemented (next phase)
 - Metrics are being validated for correlation with downstream task performance
-
-## TODO
-
-- [ ] Implement dynamic batch composition based on metrics
-- [ ] Add more distance metrics
-- [ ] Experiment with metric-weighted mixing ratios
-- [ ] Validate metrics across multiple datasets
-- [ ] Add visualization tools for metric trajectories

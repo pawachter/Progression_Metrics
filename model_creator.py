@@ -34,23 +34,61 @@ class ModelCreator:
         dropout_rate = config['dropout_rate']
         dense_layers = config['dense_layers']
         final_activation = config['final_activation']
+        pooling = config.get('pooling', {})
+        padding = config.get('padding', 'valid')
+
+        # He initialization for convolutional and dense layers
+        he_initializer = tf.keras.initializers.HeNormal()
+        # Zero initialization for final classifier
+        zero_initializer = tf.keras.initializers.Zeros()
 
         inputs = Input(shape=input_shape)
         x = inputs
 
         for layer in conv_layers:
-            x = Conv2D(filters=layer['filters'], kernel_size=layer['kernel_size'], activation=layer['activation'])(x)
+            # Conv → BN → ReLU pattern with He initialization and same padding
+            x = Conv2D(
+                filters=layer['filters'], 
+                kernel_size=layer['kernel_size'], 
+                activation=None,  # No activation here
+                padding=padding,
+                kernel_initializer=he_initializer
+            )(x)
+            
             if batch_norm:
                 x = BatchNormalization()(x)
+            
+            # Apply activation after batch norm
+            x = tf.keras.layers.Activation(layer['activation'])(x)
+            
+            # Add pooling layer if specified
+            if pooling.get('enabled', False):
+                pool_size = pooling.get('pool_size', [2, 2])
+                pool_type = pooling.get('type', 'max')
+                
+                if pool_type == 'max':
+                    x = tf.keras.layers.MaxPooling2D(pool_size=pool_size)(x)
+                elif pool_type == 'average':
+                    x = tf.keras.layers.AveragePooling2D(pool_size=pool_size)(x)
 
         x = Flatten()(x)
         x = Dropout(dropout_rate)(x)
 
         for layer in dense_layers:
-            x = Dense(units=layer['units'], activation=layer['activation'])(x)
+            x = Dense(
+                units=layer['units'], 
+                activation=layer['activation'],
+                kernel_initializer=he_initializer
+            )(x)
             x = Dropout(dropout_rate)(x)
 
-        outputs = Dense(units=num_classes, activation=final_activation)(x)
+        # Final classifier with zero initialization
+        outputs = Dense(
+            units=num_classes, 
+            activation=final_activation,
+            kernel_initializer=zero_initializer,
+            bias_initializer=zero_initializer
+        )(x)
 
         return Model(inputs=inputs, outputs=outputs)
 

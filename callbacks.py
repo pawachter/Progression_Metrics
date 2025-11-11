@@ -9,6 +9,9 @@ import numpy as np
 import logging
 import yaml
 import os
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+import threading
 from distance_metrics import (
     compute_mmd,
     compute_kl_divergence,
@@ -30,7 +33,15 @@ def get_logger(name, log_dir='logs', log_file='training.log'):
         fh = logging.FileHandler(os.path.join(log_dir, log_file))
         fh.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(message)s'))
         logger.addHandler(fh)
+        logger.propagate = False  # Prevent propagation to root logger (console)
     return logger
+
+
+def log_and_flush(logger, message):
+    """Log message and immediately flush to disk for real-time logging"""
+    logger.info(message)
+    for handler in logger.handlers:
+        handler.flush()
 
 
 # ============================================================================
@@ -38,144 +49,320 @@ def get_logger(name, log_dir='logs', log_file='training.log'):
 # ============================================================================
 
 class GradientAnalysisCallback(tf.keras.callbacks.Callback):
-    """Analyze gradient statistics: norm, SNR, cosine similarity"""
+    """Analyze gradient statistics: norm, SNR, cosine similarity - OPTIMIZED WITH ASYNC"""
     
-    def __init__(self, log_dir='logs', K=50, ema_alpha=0.99, epsilon=1e-8):
+    def __init__(self, log_dir='logs', K=50, ema_alpha=0.99, epsilon=1e-8, max_workers=2):
         super(GradientAnalysisCallback, self).__init__()
         self.log_dir = log_dir
         self.K = K
-        self.ema_alpha = ema_alpha
-        self.epsilon = epsilon
-        self.gradients_history = []
+        self.ema_alpha = tf.constant(ema_alpha, dtype=tf.float32)
+        self.epsilon = tf.constant(epsilon, dtype=tf.float32)
+        # Use deque for efficient pop/append and store as tensors
+        self.gradients_history = deque(maxlen=K)
         self.ema_cosine_similarity = None
         self.logger = get_logger('GradientAnalysis', log_dir, 'training.log')
+        
+        # Threading support
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.lock = threading.Lock()
+        self.pending_futures = []
 
     def on_train_begin(self, logs=None):
-        self.gradients_history = []
+        self.gradients_history.clear()
         self.ema_cosine_similarity = None
+        self.pending_futures = []
 
     def on_batch_end(self, batch, logs=None):
         if not hasattr(self.model, 'current_gradients') or self.model.current_gradients is None:
             return
         
+        # Keep as TensorFlow tensor - NO numpy conversion
         gradients = self.flatten_gradients(self.model.current_gradients)
-        global_gradient_norm = tf.norm(gradients, ord=2).numpy()
-        self.logger.info(f"Batch {batch + 1}: Global Gradient Norm = {global_gradient_norm}")
+        global_gradient_norm = tf.norm(gradients, ord=2)
+        
+        # Log gradient norm immediately (fast operation)
+        log_and_flush(self.logger, f"Batch {batch + 1}: Global Gradient Norm = {global_gradient_norm.numpy():.6f}")
+        
+        # Store as numpy for thread safety (TensorFlow operations in threads can be problematic)
+        gradients_numpy = gradients.numpy()
+        
+        # Thread-safe update of history
+        with self.lock:
+            self.gradients_history.append(gradients_numpy)
+            history_snapshot = list(self.gradients_history)
+            ema_snapshot = self.ema_cosine_similarity
+        
+        # Submit async computation
+        future = self.executor.submit(
+            self._compute_metrics_async, 
+            batch, 
+            history_snapshot, 
+            ema_snapshot,
+            self.K,
+            float(self.ema_alpha.numpy()),
+            float(self.epsilon.numpy())
+        )
+        self.pending_futures.append(future)
+        
+        # Clean up completed futures
+        self.pending_futures = [f for f in self.pending_futures if not f.done()]
 
-        self.gradients_history.append(gradients.numpy())
-        if len(self.gradients_history) > self.K:
-            self.gradients_history.pop(0)
+    def _compute_metrics_async(self, batch, history_snapshot, ema_snapshot, K, ema_alpha, epsilon):
+        """Compute SNR and cosine similarity asynchronously in a separate thread"""
+        try:
+            # Compute SNR when we have K gradients
+            if len(history_snapshot) == K:
+                snr = self._compute_snr_numpy(history_snapshot, epsilon)
+                log_and_flush(self.logger, f"Batch {batch + 1}: SNR = {snr:.6f}")
+            
+            # Compute cosine similarity
+            if len(history_snapshot) > 1:
+                cosine_similarity = self._compute_cosine_similarity_numpy(
+                    history_snapshot[-1], 
+                    history_snapshot[-2],
+                    epsilon
+                )
+                
+                if ema_snapshot is None:
+                    new_ema = cosine_similarity
+                else:
+                    new_ema = ema_alpha * ema_snapshot + (1.0 - ema_alpha) * cosine_similarity
+                
+                # Thread-safe update of EMA
+                with self.lock:
+                    self.ema_cosine_similarity = new_ema
+                
+                log_and_flush(self.logger, f"Batch {batch + 1}: EMA Cosine Similarity = {new_ema:.6f}")
+        except Exception as e:
+            self.logger.error(f"Error in async metric computation: {e}")
 
-        if len(self.gradients_history) == self.K:
-            snr = self.compute_snr(self.gradients_history)
-            self.logger.info(f"Batch {batch + 1}: SNR = {snr}")
+    def _compute_snr_numpy(self, gradients_history, epsilon):
+        """Compute SNR using numpy operations"""
+        gradients_stack = np.stack(gradients_history, axis=0)
+        mean_gradient = np.mean(gradients_stack, axis=0)
+        variance_gradient = np.mean(np.square(gradients_stack - mean_gradient), axis=0)
+        snr = np.linalg.norm(mean_gradient) / np.sqrt(np.sum(variance_gradient) + epsilon)
+        return snr
 
-        if len(self.gradients_history) > 1:
-            cosine_similarity = self.compute_cosine_similarity(
-                self.gradients_history[-1], 
-                self.gradients_history[-2]
-            )
-            if self.ema_cosine_similarity is None:
-                self.ema_cosine_similarity = cosine_similarity
-            else:
-                self.ema_cosine_similarity = (self.ema_alpha * self.ema_cosine_similarity + 
-                                             (1 - self.ema_alpha) * cosine_similarity)
-            self.logger.info(f"Batch {batch + 1}: EMA Cosine Similarity = {self.ema_cosine_similarity}")
+    def _compute_cosine_similarity_numpy(self, grad1, grad2, epsilon):
+        """Compute cosine similarity using numpy operations"""
+        dot_product = np.sum(grad1 * grad2)
+        norm_grad1 = np.linalg.norm(grad1)
+        norm_grad2 = np.linalg.norm(grad2)
+        cosine_similarity = dot_product / (norm_grad1 * norm_grad2 + epsilon)
+        return cosine_similarity
 
+    def on_train_end(self, logs=None):
+        """Wait for all pending computations and cleanup"""
+        log_and_flush(self.logger, "Waiting for pending gradient analysis computations...")
+        for future in self.pending_futures:
+            try:
+                future.result(timeout=30)  # Wait max 30 seconds per task
+            except Exception as e:
+                self.logger.error(f"Error waiting for async task: {e}")
+        self.executor.shutdown(wait=True)
+        log_and_flush(self.logger, "Gradient analysis cleanup complete")
+
+    # Remove @tf.function - this needs to run in eager mode
     def flatten_gradients(self, gradients):
+        """Flatten gradients using pure TensorFlow ops"""
         flattened = []
         for grad in gradients:
             if grad is not None:
                 flattened.append(tf.reshape(grad, [-1]))
         return tf.concat(flattened, axis=0)
 
-    def compute_snr(self, gradients_history):
-        gradients_array = np.array(gradients_history)
-        mean_gradient = np.mean(gradients_array, axis=0)
-        variance_gradient = np.mean((gradients_array - mean_gradient) ** 2, axis=0)
-        snr = np.linalg.norm(mean_gradient) / np.sqrt(np.sum(variance_gradient) + self.epsilon)
-        return snr
-
-    def compute_cosine_similarity(self, grad1, grad2):
-        dot_product = np.sum(grad1 * grad2)
-        norm_grad1 = np.linalg.norm(grad1)
-        norm_grad2 = np.linalg.norm(grad2)
-        cosine_similarity = dot_product / (norm_grad1 * norm_grad2 + self.epsilon)
-        return cosine_similarity
-
 
 class FisherTraceCallback(tf.keras.callbacks.Callback):
-    """Compute Fisher Information trace on validation sets"""
+    """Compute Fisher Information trace on validation sets - OPTIMIZED WITH ASYNC"""
     
-    def __init__(self, val_dataset_a, val_dataset_b, n_steps=100, log_dir='logs'):
+    def __init__(self, val_dataset_a, n_steps=100, log_dir='logs', num_batches=10, batch_size=32, max_workers=1):
         super(FisherTraceCallback, self).__init__()
-        self.val_dataset_a = val_dataset_a
-        self.val_dataset_b = val_dataset_b
+        # Pre-batch, cache, repeat, and prefetch the dataset for optimal performance
+        self.val_dataset_a = (val_dataset_a
+                             .batch(batch_size)
+                             .take(num_batches)
+                             .cache()
+                             .repeat()
+                             .prefetch(tf.data.AUTOTUNE))
         self.n_steps = n_steps
         self.log_dir = log_dir
         self.step_counter = 0
+        self.num_batches = num_batches
         self.logger = get_logger('FisherTrace', log_dir, 'training.log')
+        self.loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=False)
+        
+        # Threading support
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.pending_futures = []
 
     def on_train_begin(self, logs=None):
         self.step_counter = 0
+        self.pending_futures = []
 
     def on_batch_end(self, batch, logs=None):
         self.step_counter += 1
         if self.step_counter % self.n_steps == 0:
-            fisher_trace_a = self.compute_fisher_trace(self.val_dataset_a)
-            fisher_trace_b = self.compute_fisher_trace(self.val_dataset_b)
-            self.logger.info(f"Step {self.step_counter}: Fisher Trace (Val Set A) = {fisher_trace_a}")
-            self.logger.info(f"Step {self.step_counter}: Fisher Trace (Val Set B) = {fisher_trace_b}")
-
-    def compute_fisher_trace(self, dataset):
-        loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
-        fisher_trace = 0.0
-        
-        for images, labels in dataset.batch(32).take(10):
-            with tf.GradientTape() as tape:
-                logits = self.model(images, training=False)
-                loss = loss_fn(labels, logits)
+            # Submit async computation
+            future = self.executor.submit(
+                self._compute_fisher_async,
+                self.step_counter
+            )
+            self.pending_futures.append(future)
             
-            grads = tape.gradient(loss, self.model.trainable_variables)
-            for grad in grads:
-                if grad is not None:
-                    fisher_trace += tf.reduce_sum(tf.square(grad)).numpy()
+            # Clean up completed futures
+            self.pending_futures = [f for f in self.pending_futures if not f.done()]
+
+    def _compute_fisher_async(self, step_counter):
+        """Compute Fisher trace asynchronously in a separate thread"""
+        try:
+            fisher_trace_a = self.compute_fisher_trace_tf()
+            log_and_flush(self.logger, f"Step {step_counter}: Fisher Trace (Val Set A) = {fisher_trace_a.numpy():.6f}")
+        except Exception as e:
+            self.logger.error(f"Error in async Fisher trace computation: {e}")
+
+    def on_train_end(self, logs=None):
+        """Wait for all pending computations and cleanup"""
+        log_and_flush(self.logger, "Waiting for pending Fisher trace computations...")
+        for future in self.pending_futures:
+            try:
+                future.result(timeout=60)  # Wait max 60 seconds per task
+            except Exception as e:
+                self.logger.error(f"Error waiting for async task: {e}")
+        self.executor.shutdown(wait=True)
+        log_and_flush(self.logger, "Fisher trace cleanup complete")
+
+    @tf.function  # JIT compile for speed
+    def _compute_batch_fisher(self, images, labels):
+        """Compute Fisher trace for a single batch"""
+        with tf.GradientTape() as tape:
+            logits = self.model(images, training=False)
+            loss = self.loss_fn(labels, logits)
+        
+        grads = tape.gradient(loss, self.model.trainable_variables)
+        
+        # Sum of squared gradients using TensorFlow operations
+        batch_fisher = tf.constant(0.0)
+        for grad in grads:
+            if grad is not None:
+                batch_fisher += tf.reduce_sum(tf.square(grad))
+        
+        return batch_fisher
+
+    def compute_fisher_trace_tf(self):
+        """Compute Fisher trace using pure TensorFlow operations"""
+        fisher_trace = tf.constant(0.0)
+        
+        # Create an iterator from the dataset (resets each time)
+        batch_count = 0
+        for images, labels in self.val_dataset_a:
+            if batch_count >= self.num_batches:
+                break
+            fisher_trace += self._compute_batch_fisher(images, labels)
+            batch_count += 1
         
         return fisher_trace
 
 
 class ActivationSaturationCallback(tf.keras.callbacks.Callback):
-    """Monitor ReLU activation saturation"""
+    """Monitor ReLU activation saturation - OPTIMIZED WITH ASYNC"""
     
-    def __init__(self, val_dataset, epsilon=1e-3, log_dir='logs'):
+    def __init__(self, val_dataset, epsilon=1e-3, log_dir='logs', num_batches=5, batch_size=32, max_workers=2):
         super(ActivationSaturationCallback, self).__init__()
-        self.val_dataset = val_dataset
-        self.epsilon = epsilon
+        # Pre-batch, cache, repeat, and prefetch the dataset for optimal performance
+        self.val_dataset = (val_dataset
+                           .batch(batch_size)
+                           .take(num_batches)
+                           .cache()
+                           .repeat()
+                           .prefetch(tf.data.AUTOTUNE))
+        self.epsilon = tf.constant(epsilon, dtype=tf.float32)
         self.log_dir = log_dir
+        self.num_batches = num_batches
         self.logger = get_logger('ActivationSaturation', log_dir, 'training.log')
+        # Cache intermediate models
+        self.intermediate_models = {}
+        
+        # Threading support
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.pending_futures = []
 
     def on_epoch_end(self, epoch, logs=None):
+        relu_layers = []
         for layer in self.model.layers:
             if hasattr(layer, 'activation') and layer.activation is not None:
                 activation_name = layer.activation.__name__ if hasattr(layer.activation, '__name__') else str(layer.activation)
-                
                 if 'relu' in activation_name.lower():
-                    saturation = self.compute_saturation(layer)
-                    self.logger.info(f"Epoch {epoch + 1}: Layer {layer.name} ReLU Saturation = {saturation}")
+                    relu_layers.append(layer)
+        
+        # Submit async computation for all ReLU layers
+        for layer in relu_layers:
+            future = self.executor.submit(
+                self._compute_saturation_async,
+                epoch,
+                layer
+            )
+            self.pending_futures.append(future)
+        
+        # Clean up completed futures
+        self.pending_futures = [f for f in self.pending_futures if not f.done()]
 
-    def compute_saturation(self, layer):
-        intermediate_model = tf.keras.Model(inputs=self.model.input, outputs=layer.output)
-        
-        total_near_zero = 0
-        total_elements = 0
-        
-        for images, _ in self.val_dataset.batch(32).take(5):
-            activations = intermediate_model(images, training=False)
-            total_near_zero += tf.reduce_sum(tf.cast(tf.abs(activations) < self.epsilon, tf.float32)).numpy()
-            total_elements += tf.size(activations).numpy()
-        
-        return total_near_zero / total_elements if total_elements > 0 else 0.0
+    def _compute_saturation_async(self, epoch, layer):
+        """Compute saturation asynchronously in a separate thread"""
+        try:
+            saturation = self.compute_saturation_tf(layer)
+            log_and_flush(self.logger, f"Epoch {epoch + 1}: Layer {layer.name} ReLU Saturation = {saturation.numpy():.6f}")
+        except Exception as e:
+            self.logger.error(f"Error in async saturation computation for layer {layer.name}: {e}")
 
+    def on_train_end(self, logs=None):
+        """Wait for all pending computations and cleanup"""
+        log_and_flush(self.logger, "Waiting for pending activation saturation computations...")
+        for future in self.pending_futures:
+            try:
+                future.result(timeout=60)  # Wait max 60 seconds per task
+            except Exception as e:
+                self.logger.error(f"Error waiting for async task: {e}")
+        self.executor.shutdown(wait=True)
+        log_and_flush(self.logger, "Activation saturation cleanup complete")
+
+    def get_intermediate_model(self, layer):
+        """Cache intermediate models to avoid recreating them"""
+        if layer.name not in self.intermediate_models:
+            self.intermediate_models[layer.name] = tf.keras.Model(
+                inputs=self.model.input, 
+                outputs=layer.output
+            )
+        return self.intermediate_models[layer.name]
+
+    @tf.function  # JIT compile for speed
+    def _compute_batch_saturation(self, intermediate_model, images):
+        """Compute saturation for a single batch"""
+        activations = intermediate_model(images, training=False)
+        near_zero = tf.reduce_sum(
+            tf.cast(tf.abs(activations) < self.epsilon, tf.float32)
+        )
+        total = tf.cast(tf.size(activations), tf.float32)
+        return near_zero, total
+
+    def compute_saturation_tf(self, layer):
+        """Compute saturation using pure TensorFlow operations"""
+        intermediate_model = self.get_intermediate_model(layer)
+        
+        total_near_zero = tf.constant(0.0)
+        total_elements = tf.constant(0.0)
+        
+        # Iterate with manual count to avoid iterator exhaustion
+        batch_count = 0
+        for images, _ in self.val_dataset:
+            if batch_count >= self.num_batches:
+                break
+            near_zero, total = self._compute_batch_saturation(intermediate_model, images)
+            total_near_zero += near_zero
+            total_elements += total
+            batch_count += 1
+        
+        return total_near_zero / tf.maximum(total_elements, 1.0)
 
 # ============================================================================
 # DOMAIN ADAPTATION CALLBACKS
@@ -205,9 +392,12 @@ class TargetDomainGapCallback(tf.keras.callbacks.Callback):
         self.best_loss_b = float('inf')
         self.loss_history = []
         self.ema_loss = None
-        self.logger.info("=" * 60)
-        self.logger.info("Target Domain Gap Tracking Started")
-        self.logger.info("=" * 60)
+        #self.logger.info("=" * 60)
+        #self.logger.info("Target Domain Gap Tracking Started")
+        #self.logger.info("=" * 60)
+        log_and_flush(self.logger, "=" * 60)
+        log_and_flush(self.logger, "Target Domain Gap Tracking Started")
+        log_and_flush(self.logger, "=" * 60)
     
     def on_batch_end(self, batch, logs=None):
         self.step_counter += 1
@@ -230,7 +420,8 @@ class TargetDomainGapCallback(tf.keras.callbacks.Callback):
             
             gap = current_loss - self.best_loss_b
             
-            self.logger.info(
+            #self.logger.info(
+            log_and_flush(self.logger, 
                 f"Step {self.step_counter}: "
                 f"Loss_B={current_loss:.4f}, "
                 f"Best={self.best_loss_b:.4f}, "
@@ -240,7 +431,7 @@ class TargetDomainGapCallback(tf.keras.callbacks.Callback):
     
     def compute_validation_loss(self, dataset):
         losses = []
-        for images, labels in dataset.batch(32):
+        for images, labels in dataset:
             logits = self.model(images, training=False)
             loss = self.loss_fn(labels, logits)
             losses.append(float(loss))
@@ -263,9 +454,12 @@ class EntropyGapCallback(tf.keras.callbacks.Callback):
     
     def on_train_begin(self, logs=None):
         self.step_counter = 0
-        self.logger.info("=" * 60)
-        self.logger.info("Entropy Gap Tracking Started")
-        self.logger.info("=" * 60)
+        #self.logger.info("=" * 60)
+        #self.logger.info("Entropy Gap Tracking Started")
+        #self.logger.info("=" * 60)
+        log_and_flush(self.logger, "=" * 60)
+        log_and_flush(self.logger, "Entropy Gap Tracking Started")
+        log_and_flush(self.logger, "=" * 60)
     
     def on_batch_end(self, batch, logs=None):
         self.step_counter += 1
@@ -275,7 +469,8 @@ class EntropyGapCallback(tf.keras.callbacks.Callback):
             entropy_b = self.compute_entropy_dataset(self.dataset_b_subset)
             gap = entropy_b - entropy_a
             
-            self.logger.info(
+            #self.logger.info(
+            log_and_flush(self.logger, 
                 f"Step {self.step_counter}: "
                 f"H_A={entropy_a:.4f}, "
                 f"H_B={entropy_b:.4f}, "
@@ -284,7 +479,7 @@ class EntropyGapCallback(tf.keras.callbacks.Callback):
     
     def compute_entropy_dataset(self, dataset):
         all_logits = []
-        for images, _ in dataset.batch(self.batch_size):
+        for images, _ in dataset:
             logits = self.model(images, training=False)
             all_logits.append(logits.numpy())
         
@@ -320,16 +515,21 @@ class RepresentationMismatchCallback(tf.keras.callbacks.Callback):
         self.identify_layer_positions()
         self.create_intermediate_models()
         
-        self.logger.info("=" * 60)
-        self.logger.info("Representation Mismatch Tracking Started")
-        self.logger.info(f"Monitoring layers: {list(self.layer_names.values())}")
-        self.logger.info("=" * 60)
+        #self.logger.info("=" * 60)
+        #self.logger.info("Representation Mismatch Tracking Started")
+        #self.logger.info(f"Monitoring layers: {list(self.layer_names.values())}")
+        #self.logger.info("=" * 60)
+        log_and_flush(self.logger, "=" * 60)
+        log_and_flush(self.logger, "Representation Mismatch Tracking Started")
+        log_and_flush(self.logger, f"Monitoring layers: {list(self.layer_names.values())}")
+        log_and_flush(self.logger, "=" * 60)
     
     def on_batch_end(self, batch, logs=None):
         self.step_counter += 1
         
         if self.step_counter % self.n_steps == 0:
-            self.logger.info(f"Step {self.step_counter} - Computing representation distances...")
+            #self.logger.info(f"Step {self.step_counter} - Computing representation distances...")
+            log_and_flush(self.logger, f"Step {self.step_counter} - Computing representation distances...")
             
             for position, layer_name in self.layer_names.items():
                 embeddings_a = self.extract_embeddings(self.dataset_a_subset, position)
@@ -340,7 +540,8 @@ class RepresentationMismatchCallback(tf.keras.callbacks.Callback):
                 kl = compute_kl_divergence(embeddings_a, embeddings_b)
                 wasserstein = compute_wasserstein_distance(embeddings_a, embeddings_b)
                 
-                self.logger.info(
+                #self.logger.info(
+                log_and_flush(self.logger, 
                     f"  Layer={layer_name} ({position}): "
                     f"MMD={mmd:.4f}, KL={kl:.4f}, Wasserstein={wasserstein:.4f}"
                 )
@@ -370,7 +571,7 @@ class RepresentationMismatchCallback(tf.keras.callbacks.Callback):
     
     def extract_embeddings(self, dataset, position):
         embeddings = []
-        for images, _ in dataset.batch(self.batch_size):
+        for images, _ in dataset:
             layer_output = self.intermediate_models[position](images, training=False)
             if len(layer_output.shape) > 2:
                 batch_size = tf.shape(layer_output)[0]
@@ -447,30 +648,32 @@ class CallbackFactory:
     # Convergence Monitoring Callbacks
     # ------------------------------------------------------------------------
     
-    def create_gradient_analysis(self, log_dir='logs', K=50, ema_alpha=0.99, epsilon=1e-8):
+    def create_gradient_analysis(self, log_dir='logs', K=50, ema_alpha=0.99, epsilon=1e-8, max_workers=2):
         """Create GradientAnalysisCallback"""
         return GradientAnalysisCallback(
             log_dir=log_dir,
             K=K,
             ema_alpha=ema_alpha,
-            epsilon=epsilon
+            epsilon=epsilon,
+            max_workers=max_workers
         )
     
-    def create_fisher_trace(self, val_dataset_a, val_dataset_b, n_steps=100, log_dir='logs'):
+    def create_fisher_trace(self, val_dataset_a, n_steps=100, log_dir='logs', max_workers=1):
         """Create FisherTraceCallback"""
         return FisherTraceCallback(
             val_dataset_a=val_dataset_a,
-            val_dataset_b=val_dataset_b,
             n_steps=n_steps,
-            log_dir=log_dir
+            log_dir=log_dir,
+            max_workers=max_workers
         )
     
-    def create_activation_saturation(self, val_dataset, epsilon=1e-3, log_dir='logs'):
+    def create_activation_saturation(self, val_dataset, epsilon=1e-3, log_dir='logs', max_workers=2):
         """Create ActivationSaturationCallback"""
         return ActivationSaturationCallback(
             val_dataset=val_dataset,
             epsilon=epsilon,
-            log_dir=log_dir
+            log_dir=log_dir,
+            max_workers=max_workers
         )
     
     # ------------------------------------------------------------------------
@@ -517,7 +720,7 @@ class CallbackFactory:
     # Batch Creation Methods
     # ------------------------------------------------------------------------
     
-    def create_all_convergence_callbacks(self, val_dataset, test_dataset, log_dir='logs'):
+    def create_all_convergence_callbacks(self, val_dataset, log_dir='logs'):
         """
         Create all convergence monitoring callbacks
         
@@ -531,7 +734,7 @@ class CallbackFactory:
         """
         return [
             self.create_gradient_analysis(log_dir=log_dir, K=50, ema_alpha=0.99),
-            self.create_fisher_trace(val_dataset, test_dataset, n_steps=100, log_dir=log_dir),
+            self.create_fisher_trace(val_dataset, n_steps=100, log_dir=log_dir),
             self.create_activation_saturation(val_dataset, epsilon=1e-3, log_dir=log_dir)
         ]
     
@@ -594,7 +797,7 @@ class CallbackFactory:
             self.create_checkpoint(
                 filepath=checkpoint_path,
                 monitor=monitor,
-                mode='max',
+                mode='min',
                 save_best_only=True
             ),
             self.create_early_stopping(

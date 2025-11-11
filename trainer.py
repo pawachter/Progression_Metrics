@@ -1,3 +1,5 @@
+from multiprocessing.spawn import prepare
+from random import shuffle
 import tensorflow as tf
 from tensorflow.keras.callbacks import CallbackList
 import numpy as np
@@ -23,18 +25,19 @@ class Trainer:
         self.callbacks = CallbackList(callbacks if callbacks is not None else [], model=model)
         self.model.current_gradients = None  # Initialize on model, not self
 
+    @tf.function
     def train_step(self, x, y):
         with tf.GradientTape() as tape:
             logits = self.model(x, training=True)
             loss = self.loss_fn(y, logits)
         
         gradients = tape.gradient(loss, self.model.trainable_variables)
-        self.model.current_gradients = gradients  # Store on model
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
         
         self.train_acc_metric.update_state(y, logits)
-        return loss
+        return loss, gradients  # Return gradients from the function
 
+    @tf.function
     def val_step(self, x, y):
         logits = self.model(x, training=False)
         loss = self.loss_fn(y, logits)
@@ -47,8 +50,8 @@ class Trainer:
         
         history = {'loss': [], 'accuracy': [], 'val_loss': [], 'val_accuracy': []}
         
-        train_ds = self.train_dataset.batch(batch_size)
-        val_ds = self.val_dataset.batch(batch_size)
+        train_ds = self.prepare_for_training(self.train_dataset, batch_size=batch_size)
+        val_ds = self.prepare_for_training(self.val_dataset, batch_size=batch_size, shuffle=False)
         
         self.callbacks.on_train_begin()
         
@@ -62,7 +65,9 @@ class Trainer:
             for batch_idx, (x_batch, y_batch) in enumerate(train_ds):
                 self.callbacks.on_batch_begin(batch_idx)
                 
-                loss = self.train_step(x_batch, y_batch)
+                loss, gradients = self.train_step(x_batch, y_batch)
+                # Store gradients after they're returned from tf.function (now in eager scope)
+                self.model.current_gradients = gradients
                 epoch_loss.append(loss)
                 
                 logs = {'loss': float(loss), 'accuracy': float(self.train_acc_metric.result())}
@@ -112,7 +117,7 @@ class Trainer:
 
     def evaluate(self, batch_size=32):
         self.val_acc_metric.reset_state()
-        test_ds = self.test_dataset.batch(batch_size)
+        test_ds = self.prepare_for_training(self.test_dataset, batch_size=batch_size, shuffle=False)
         test_losses = []
         
         for x_batch, y_batch in test_ds:
@@ -120,3 +125,44 @@ class Trainer:
             test_losses.append(loss)
         
         return np.mean(test_losses), float(self.val_acc_metric.result())
+    
+    def prepare_for_training(self, dataset, batch_size=None, cache=True, shuffle=True,
+                            shuffle_buffer=1000, prefetch=True):
+        """
+        Apply performance optimizations for training.
+        
+        Follows TensorFlow's recommended dataset pipeline:
+        1. Cache (if dataset fits in memory)
+        2. Shuffle (for training)
+        3. Batch
+        4. Prefetch (overlap data loading with training)
+        
+        Args:
+            dataset: Input tf.data.Dataset
+            batch_size: Batch size (uses default if None)
+            cache: Whether to cache dataset in memory
+            shuffle_buffer: Buffer size for shuffling
+            prefetch: Whether to prefetch batches
+        
+        Returns:
+            Optimized tf.data.Dataset ready for training
+        """
+        if batch_size is None:
+            batch_size = self.batch_size
+        
+        # Cache dataset (if it fits in memory, speeds up training)
+        if cache:
+            dataset = dataset.cache()
+        
+        # Shuffle for training
+        if shuffle:
+            dataset = dataset.shuffle(buffer_size=dataset.cardinality().numpy() if tf.data.experimental.cardinality(dataset) != tf.data.UNKNOWN_CARDINALITY else shuffle_buffer, reshuffle_each_iteration=True)
+        
+        # Batch the dataset
+        dataset = dataset.batch(batch_size)
+        
+        # Prefetch for performance
+        if prefetch:
+            dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+        
+        return dataset

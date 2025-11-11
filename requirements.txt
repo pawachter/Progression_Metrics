@@ -1,0 +1,14 @@
+# Deep Learning Framework
+tensorflow>=2.13.0
+
+# Numerical Computing
+numpy>=1.24.0
+
+# Configuration
+pyyaml>=6.0
+
+# Statistical Distance Metrics
+scipy>=1.11.0
+
+# Optional: For better logging and visualization
+matplotlib>=3.7.0

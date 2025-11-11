@@ -2,6 +2,7 @@ models:
   CNN:
     input_shape: [32, 32, 3]
     num_classes: 10
+    padding: 'same'  # Use same padding for convolutions
     conv_layers:
       - filters: 32
         kernel_size: [3, 3]
@@ -10,6 +11,10 @@ models:
         kernel_size: [3, 3]
         activation: 'relu'
     batch_norm: true
+    pooling:
+      enabled: true
+      type: 'max'  # Options: 'max' or 'average'
+      pool_size: [2, 2]
     dropout_rate: 0.25
     dense_layers:
       - units: 128
@@ -43,12 +48,33 @@ models:
     final_activation: 'softmax'
     
 training:
-  epochs: 50
+  epochs: 1
   batch_size: 32
   optimizer: 'adam'
   learning_rate: 0.001
   train_split: 0.7
   val_split: 0.15
   test_split: 0.15
+  early_stopping_patience: 10
+
+domain_adaptation:
+  enabled: false  # Set to true to enable domain adaptation tracking
+  subset_size: 500  # Number of samples to hold out from each domain for DA metrics
+  n_steps: 100  # Compute DA metrics every N training steps
+  
+  # Target Domain Gap tracking
+  target_gap:
+    k_window: 10  # Window size for loss history
+    ema_alpha: 0.9  # Exponential moving average smoothing factor
+  
+  # Entropy Gap tracking
+  entropy_gap:
+    batch_size: 32  # Batch size for entropy computation
+  
+  # Representation Mismatch tracking
+  representation_mismatch:
+    batch_size: 32  # Batch size for representation extraction
+    mmd_kernel: 'rbf'  # Kernel type for MMD: 'rbf' or 'linear'
+    mmd_gamma: 1.0  # Bandwidth parameter for RBF kernel
 
 callbacks: {}
