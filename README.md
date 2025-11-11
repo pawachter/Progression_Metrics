@@ -79,38 +79,6 @@ Logs are written to:
 - `logs/training.log` - Gradient analysis, Fisher trace, activation saturation
 - `logs/domain_adaptation.log` - All domain shift metrics
 
-## Dataset Structure
-
-Expected format:
-```
-data/
-├── REAL/
-│   ├── 0/*.jpg  (or class_0, label_0, etc.)
-│   ├── 1/*.jpg
-│   ├── 2/*.jpg
-│   ├── ...
-│   └── 9/*.jpg
-└── FAKE/
-    ├── 0/*.jpg
-    ├── 1/*.jpg
-    ├── 2/*.jpg
-    ├── ...
-    └── 9/*.jpg
-```
-
-- Each image type (REAL/FAKE) has subdirectories for each class
-- Class labels are automatically inferred from subdirectory names using TensorFlow's `image_dataset_from_directory`
-- Subdirectories are sorted alphanumerically to determine class indices
-- Supports any valid folder names (e.g., `0`, `class_0`, `label_0`) - labels are inferred from sort order
-
-### DataLoader Features
-
-The DataLoader now uses **TensorFlow's best practices**:
-- ✅ Built-in `image_dataset_from_directory` API (faster, simpler, more reliable)
-- ✅ Automatic label inference from directory structure
-- ✅ Efficient batching and prefetching with `tf.data.AUTOTUNE`
-- ✅ Proper caching and shuffling for optimal performance
-- ✅ Reproducible dataset splits with seed control
 
 ## Callbacks
 
