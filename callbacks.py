@@ -45,6 +45,48 @@ def log_and_flush(logger, message):
 
 
 # ============================================================================
+# TRAINING METRICS LOGGING CALLBACK
+# ============================================================================
+
+class TrainingMetricsLogger(tf.keras.callbacks.Callback):
+    """Log training and validation metrics (loss, accuracy) to training.log"""
+    
+    def __init__(self, log_dir='logs'):
+        super(TrainingMetricsLogger, self).__init__()
+        self.log_dir = log_dir
+        self.logger = get_logger('TrainingMetrics', log_dir, 'training.log')
+    
+    def on_train_begin(self, logs=None):
+        log_and_flush(self.logger, "=" * 60)
+        log_and_flush(self.logger, "Training Started")
+        log_and_flush(self.logger, "=" * 60)
+    
+    def on_epoch_end(self, epoch, logs=None):
+        if logs is None:
+            return
+        
+        # Extract metrics from logs
+        train_loss = logs.get('loss', 'N/A')
+        train_acc = logs.get('accuracy', 'N/A')
+        val_loss = logs.get('val_loss', 'N/A')
+        val_acc = logs.get('val_accuracy', 'N/A')
+        
+        # Format the log message
+        message = f"Epoch {epoch + 1}: "
+        message += f"Train Loss = {train_loss:.6f}, " if isinstance(train_loss, (int, float)) else f"Train Loss = {train_loss}, "
+        message += f"Train Acc = {train_acc:.6f}, " if isinstance(train_acc, (int, float)) else f"Train Acc = {train_acc}, "
+        message += f"Val Loss = {val_loss:.6f}, " if isinstance(val_loss, (int, float)) else f"Val Loss = {val_loss}, "
+        message += f"Val Acc = {val_acc:.6f}" if isinstance(val_acc, (int, float)) else f"Val Acc = {val_acc}"
+        
+        log_and_flush(self.logger, message)
+    
+    def on_train_end(self, logs=None):
+        log_and_flush(self.logger, "=" * 60)
+        log_and_flush(self.logger, "Training Completed")
+        log_and_flush(self.logger, "=" * 60)
+
+
+# ============================================================================
 # CONVERGENCE MONITORING CALLBACKS
 # ============================================================================
 
@@ -648,6 +690,10 @@ class CallbackFactory:
     # Convergence Monitoring Callbacks
     # ------------------------------------------------------------------------
     
+    def create_training_metrics_logger(self, log_dir='logs'):
+        """Create TrainingMetricsLogger callback"""
+        return TrainingMetricsLogger(log_dir=log_dir)
+    
     def create_gradient_analysis(self, log_dir='logs', K=50, ema_alpha=0.99, epsilon=1e-8, max_workers=2):
         """Create GradientAnalysisCallback"""
         return GradientAnalysisCallback(
@@ -783,7 +829,7 @@ class CallbackFactory:
     def create_standard_callbacks(self, checkpoint_path='checkpoints/best_model.h5',
                                   monitor='val_accuracy', patience=10):
         """
-        Create standard training callbacks (checkpoint, early stopping, tensorboard)
+        Create standard training callbacks (checkpoint, early stopping, tensorboard, metrics logging)
         
         Args:
             checkpoint_path: Path to save best model
@@ -794,6 +840,7 @@ class CallbackFactory:
             List of standard callbacks
         """
         return [
+            self.create_training_metrics_logger(log_dir='logs'),
             self.create_checkpoint(
                 filepath=checkpoint_path,
                 monitor=monitor,

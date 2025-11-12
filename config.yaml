@@ -48,14 +48,14 @@ models:
     final_activation: 'softmax'
     
 training:
-  epochs: 1
-  batch_size: 32
+  epochs: 50
+  batch_size: 64
   optimizer: 'adam'
   learning_rate: 0.001
   train_split: 0.7
   val_split: 0.15
   test_split: 0.15
-  early_stopping_patience: 10
+  early_stopping_patience: 3
 
 domain_adaptation:
   enabled: false  # Set to true to enable domain adaptation tracking
@@ -69,11 +69,11 @@ domain_adaptation:
   
   # Entropy Gap tracking
   entropy_gap:
-    batch_size: 32  # Batch size for entropy computation
+    batch_size: 64  # Batch size for entropy computation
   
   # Representation Mismatch tracking
   representation_mismatch:
-    batch_size: 32  # Batch size for representation extraction
+    batch_size: 64  # Batch size for representation extraction
     mmd_kernel: 'rbf'  # Kernel type for MMD: 'rbf' or 'linear'
     mmd_gamma: 1.0  # Bandwidth parameter for RBF kernel
 
