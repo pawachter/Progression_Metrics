@@ -7,6 +7,8 @@ Uses unified CallbackFactory for all callbacks
 import os
 import yaml
 import tensorflow as tf
+from datetime import datetime
+import shutil
 from model_creator import ModelCreator
 from load_and_create_datasets import DataLoader
 from trainer import Trainer
@@ -25,6 +27,18 @@ def setup_directories():
         os.makedirs(directory, exist_ok=True)
         print(f"✓ Created directory: {directory}")
 
+def create_run_directory(config_path='config.yaml'):
+    """Create a timestamped directory for this training run"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join('logs', timestamp)
+    os.makedirs(run_dir, exist_ok=True)
+    
+    # Copy config to run directory
+    shutil.copy(config_path, os.path.join(run_dir, 'config.yaml'))
+    
+    print(f"✓ Created run directory: {run_dir}")
+    return run_dir
+
 def main():
     print("=" * 60)
     print("CNN Training Pipeline - REAL Dataset with Domain Adaptation")
@@ -36,11 +50,15 @@ def main():
     MODEL_TYPE = 'CNN'
     
     # Setup directories
-    print("\n[1/8] Setting up directories...")
+    print("\n[1/9] Setting up directories...")
     setup_directories()
     
+    # Create run-specific directory
+    print("\n[2/9] Creating run directory...")
+    run_dir = create_run_directory(CONFIG_PATH)
+    
     # Load configuration
-    print("\n[2/8] Loading configuration...")
+    print("\n[3/9] Loading configuration...")
     config = load_training_config(CONFIG_PATH)
     training_config = config.get('training', {})
     da_config = config.get('domain_adaptation', {})
@@ -61,7 +79,7 @@ def main():
     print(f"  - Domain Adaptation: {'Enabled' if da_config.get('enabled', False) else 'Disabled'}")
     
     # Load and prepare datasets
-    print("\n[3/8] Loading datasets...")
+    print("\n[4/9] Loading datasets...")
     data_loader = DataLoader(root_dir=DATA_ROOT_DIR)
     
     try:
@@ -73,24 +91,12 @@ def main():
         dataset_a_subset = None
         dataset_b_subset = None
         
-        if da_config.get('enabled', False):
-            print("\n[3b/8] Creating held-out subsets for domain adaptation...")
-            subset_size = da_config.get('subset_size', 500)
-            
-            dataset_a_subset = dataset_a.take(subset_size).cache()
-            dataset_b_subset = dataset_b.take(subset_size).cache()
-            
-            # Skip held-out data for training
-            dataset_a = dataset_a.skip(subset_size)
-            dataset_b = dataset_b.skip(subset_size)
-            
-            print(f"  ✓ Created held-out subsets: {subset_size} samples each")
         
         # Use target domain (REAL) for training
         real_dataset = dataset_b
-        
-        # Split dataset
-        print("  - Splitting dataset...")
+        fake_dataset = dataset_a
+        # Split REAL dataset
+        print("  - Splitting real dataset...")
         train_dataset, val_dataset, test_dataset = data_loader.split_dataset(
             real_dataset,
             train_split=TRAIN_SPLIT,
@@ -98,6 +104,15 @@ def main():
             test_split=TEST_SPLIT
         )
         
+        # Split FAKE dataset
+        print("  - Splitting fake dataset...")
+        fake_train_dataset, fake_val_dataset, fake_test_dataset = data_loader.split_dataset(
+            fake_dataset,
+            train_split=TRAIN_SPLIT,
+            val_split=VAL_SPLIT,
+            test_split=TEST_SPLIT
+        )
+
         print(f"  ✓ Datasets created successfully")
         
     except ValueError as e:
@@ -109,21 +124,22 @@ def main():
         return
     
     # Create model
-    print("\n[4/8] Creating model...")
+    print("\n[5/9] Creating model...")
     model_creator = ModelCreator(CONFIG_PATH)
     model = model_creator.create_model(MODEL_TYPE)
     model.summary()
     print(f"  ✓ Model created: {MODEL_TYPE}")
     
     # Create callbacks
-    print("\n[5/8] Initializing callbacks...")
+    print("\n[6/9] Initializing callbacks...")
     callback_factory = CallbackFactory(CONFIG_PATH)
     
     # Standard callbacks
     standard_callbacks = callback_factory.create_standard_callbacks(
         checkpoint_path='checkpoints/best_model.h5',
         monitor='val_loss',
-        patience=training_config.get('early_stopping_patience', 10)
+        patience=training_config.get('early_stopping_patience', 10),
+        log_dir=run_dir
     )
     print(f"  ✓ Standard callbacks: Checkpoint, EarlyStopping, TensorBoard")
     
@@ -131,19 +147,19 @@ def main():
     convergence_callbacks = callback_factory.create_all_convergence_callbacks(
         val_dataset=val_dataset,
         #test_dataset=test_dataset,
-        log_dir='logs'
+        log_dir=run_dir
     )
     print(f"  ✓ Convergence callbacks: GradientAnalysis, FisherTrace, ActivationSaturation")
     
     # Domain adaptation callbacks (if enabled)
     all_callbacks = standard_callbacks + convergence_callbacks
     
-    if da_config.get('enabled', False) and dataset_a_subset is not None and dataset_b_subset is not None:
+    if da_config.get('enabled', False):
         da_callbacks = callback_factory.create_all_domain_adaptation_callbacks(
-            dataset_a_subset=dataset_a_subset,
-            dataset_b_subset=dataset_b_subset,
+            dataset_a_subset=val_dataset,
+            dataset_b_subset=test_dataset,
             n_steps=da_config.get('n_steps', 100),
-            log_dir='logs'
+            log_dir=run_dir
         )
         all_callbacks += da_callbacks
         print(f"  ✓ Domain Adaptation callbacks: TargetGap, EntropyGap, RepresentationMismatch")
@@ -153,10 +169,10 @@ def main():
     print(f"  Total callbacks: {len(all_callbacks)}")
     
     # Create trainer
-    print("\n[6/8] Creating trainer...")
+    print("\n[7/9] Creating trainer...")
     trainer = Trainer(
         model=model,
-        train_dataset=train_dataset,
+        train_dataset=train_dataset.take(18000).concatenate(fake_train_dataset.take(18000)),  # Limit to 18k samples for faster training
         val_dataset=val_dataset,
         test_dataset=test_dataset,
         optimizer=OPTIMIZER,
@@ -166,7 +182,7 @@ def main():
     print(f"  ✓ Trainer initialized")
     
     # Train model
-    print("\n[7/8] Starting training...")
+    print("\n[8/9] Starting training...")
     print("=" * 60)
     try:
         history = trainer.train(epochs=EPOCHS, batch_size=BATCH_SIZE)
@@ -181,7 +197,7 @@ def main():
         return
     
     # Evaluate model
-    print("\n[8/8] Evaluating model on test set...")
+    print("\n[9/9] Evaluating model on test set...")
     try:
         test_loss, test_accuracy = trainer.evaluate(batch_size=BATCH_SIZE)
         print(f"  Test Loss: {test_loss:.4f}")
@@ -201,7 +217,7 @@ def main():
     print("\n" + "=" * 60)
     print("Training Pipeline Completed")
     print("=" * 60)
-    print(f"Logs saved to: logs/")
+    print(f"Run logs saved to: {run_dir}/")
     print(f"Best model saved to: checkpoints/best_model.h5")
     print(f"Final model saved to: models/final_model.h5")
 

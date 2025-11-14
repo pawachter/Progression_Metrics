@@ -68,24 +68,25 @@ class Trainer:
                 loss, gradients = self.train_step(x_batch, y_batch)
                 # Store gradients after they're returned from tf.function (now in eager scope)
                 self.model.current_gradients = gradients
-                epoch_loss.append(loss)
+                epoch_loss.append(float(loss))  # Convert to Python float to reduce memory
                 
                 logs = {'loss': float(loss), 'accuracy': float(self.train_acc_metric.result())}
                 self.callbacks.on_batch_end(batch_idx, logs)
                 
-                if batch_idx % 50 == 0:
+                # Reduce print frequency for less overhead
+                if batch_idx % 100 == 0:
                     print(f"Batch {batch_idx}, Loss: {loss:.4f}, Acc: {self.train_acc_metric.result():.4f}")
             
-            train_loss = np.mean(epoch_loss)
+            train_loss = float(np.mean(epoch_loss))
             train_acc = float(self.train_acc_metric.result())
             
             self.val_acc_metric.reset_state()
             val_losses = []
             for x_batch, y_batch in val_ds:
                 val_loss = self.val_step(x_batch, y_batch)
-                val_losses.append(val_loss)
+                val_losses.append(float(val_loss))  # Convert to Python float
             
-            val_loss = np.mean(val_losses)
+            val_loss = float(np.mean(val_losses))
             val_acc = float(self.val_acc_metric.result())
             
             history['loss'].append(train_loss)
@@ -127,9 +128,9 @@ class Trainer:
         return np.mean(test_losses), float(self.val_acc_metric.result())
     
     def prepare_for_training(self, dataset, batch_size=None, cache=True, shuffle=True,
-                            shuffle_buffer=1000, prefetch=True):
+                            shuffle_buffer=10000, prefetch=True):
         """
-        Apply performance optimizations for training.
+        Apply performance optimizations for training - OPTIMIZED
         
         Follows TensorFlow's recommended dataset pipeline:
         1. Cache (if dataset fits in memory)
@@ -141,7 +142,7 @@ class Trainer:
             dataset: Input tf.data.Dataset
             batch_size: Batch size (uses default if None)
             cache: Whether to cache dataset in memory
-            shuffle_buffer: Buffer size for shuffling
+            shuffle_buffer: Buffer size for shuffling (increased default)
             prefetch: Whether to prefetch batches
         
         Returns:
@@ -154,14 +155,19 @@ class Trainer:
         if cache:
             dataset = dataset.cache()
         
-        # Shuffle for training
+        # Shuffle for training - use larger buffer for better shuffling
         if shuffle:
-            dataset = dataset.shuffle(buffer_size=dataset.cardinality().numpy() if tf.data.experimental.cardinality(dataset) != tf.data.UNKNOWN_CARDINALITY else shuffle_buffer, reshuffle_each_iteration=True)
+            # Try to get actual cardinality, fall back to buffer if unknown
+            card = tf.data.experimental.cardinality(dataset)
+            if card != tf.data.UNKNOWN_CARDINALITY and card != tf.data.INFINITE_CARDINALITY:
+                actual_size = int(card.numpy())
+                shuffle_buffer = min(actual_size, shuffle_buffer)
+            dataset = dataset.shuffle(buffer_size=shuffle_buffer, reshuffle_each_iteration=True)
         
         # Batch the dataset
-        dataset = dataset.batch(batch_size)
+        dataset = dataset.batch(batch_size, drop_remainder=True)  # drop_remainder=False to use all data
         
-        # Prefetch for performance
+        # Prefetch for performance - use AUTOTUNE for optimal buffer size
         if prefetch:
             dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
         

@@ -108,22 +108,33 @@ class GradientAnalysisCallback(tf.keras.callbacks.Callback):
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.lock = threading.Lock()
         self.pending_futures = []
+        
+        # Track current epoch and step counter
+        self.current_epoch = 0
+        self.step_counter = 0
 
     def on_train_begin(self, logs=None):
         self.gradients_history.clear()
         self.ema_cosine_similarity = None
         self.pending_futures = []
+        self.current_epoch = 0
+        self.step_counter = 0
+    
+    def on_epoch_begin(self, epoch, logs=None):
+        self.current_epoch = epoch
 
     def on_batch_end(self, batch, logs=None):
         if not hasattr(self.model, 'current_gradients') or self.model.current_gradients is None:
             return
         
+        self.step_counter += 1
+        
         # Keep as TensorFlow tensor - NO numpy conversion
         gradients = self.flatten_gradients(self.model.current_gradients)
         global_gradient_norm = tf.norm(gradients, ord=2)
         
-        # Log gradient norm immediately (fast operation)
-        log_and_flush(self.logger, f"Batch {batch + 1}: Global Gradient Norm = {global_gradient_norm.numpy():.6f}")
+        # Log gradient norm immediately (fast operation) with epoch number and step
+        log_and_flush(self.logger, f"Epoch {self.current_epoch + 1}, Step {self.step_counter}: Global Gradient Norm = {global_gradient_norm.numpy():.6f}")
         
         # Store as numpy for thread safety (TensorFlow operations in threads can be problematic)
         gradients_numpy = gradients.numpy()
@@ -137,7 +148,8 @@ class GradientAnalysisCallback(tf.keras.callbacks.Callback):
         # Submit async computation
         future = self.executor.submit(
             self._compute_metrics_async, 
-            batch, 
+            self.current_epoch,
+            self.step_counter, 
             history_snapshot, 
             ema_snapshot,
             self.K,
@@ -149,13 +161,13 @@ class GradientAnalysisCallback(tf.keras.callbacks.Callback):
         # Clean up completed futures
         self.pending_futures = [f for f in self.pending_futures if not f.done()]
 
-    def _compute_metrics_async(self, batch, history_snapshot, ema_snapshot, K, ema_alpha, epsilon):
+    def _compute_metrics_async(self, epoch, step_counter, history_snapshot, ema_snapshot, K, ema_alpha, epsilon):
         """Compute SNR and cosine similarity asynchronously in a separate thread"""
         try:
             # Compute SNR when we have K gradients
             if len(history_snapshot) == K:
                 snr = self._compute_snr_numpy(history_snapshot, epsilon)
-                log_and_flush(self.logger, f"Batch {batch + 1}: SNR = {snr:.6f}")
+                log_and_flush(self.logger, f"Epoch {epoch + 1}, Step {step_counter}: SNR = {snr:.6f}")
             
             # Compute cosine similarity
             if len(history_snapshot) > 1:
@@ -174,7 +186,7 @@ class GradientAnalysisCallback(tf.keras.callbacks.Callback):
                 with self.lock:
                     self.ema_cosine_similarity = new_ema
                 
-                log_and_flush(self.logger, f"Batch {batch + 1}: EMA Cosine Similarity = {new_ema:.6f}")
+                log_and_flush(self.logger, f"Epoch {epoch + 1}, Step {step_counter}: EMA Cosine Similarity = {new_ema:.6f}")
         except Exception as e:
             self.logger.error(f"Error in async metric computation: {e}")
 
@@ -205,7 +217,6 @@ class GradientAnalysisCallback(tf.keras.callbacks.Callback):
         self.executor.shutdown(wait=True)
         log_and_flush(self.logger, "Gradient analysis cleanup complete")
 
-    # Remove @tf.function - this needs to run in eager mode
     def flatten_gradients(self, gradients):
         """Flatten gradients using pure TensorFlow ops"""
         flattened = []
@@ -218,7 +229,7 @@ class GradientAnalysisCallback(tf.keras.callbacks.Callback):
 class FisherTraceCallback(tf.keras.callbacks.Callback):
     """Compute Fisher Information trace on validation sets - OPTIMIZED WITH ASYNC"""
     
-    def __init__(self, val_dataset_a, n_steps=100, log_dir='logs', num_batches=10, batch_size=32, max_workers=1):
+    def __init__(self, val_dataset_a, n_steps=100, log_dir='logs', num_batches=5, batch_size=32, max_workers=1):
         super(FisherTraceCallback, self).__init__()
         # Pre-batch, cache, repeat, and prefetch the dataset for optimal performance
         self.val_dataset_a = (val_dataset_a
@@ -237,10 +248,17 @@ class FisherTraceCallback(tf.keras.callbacks.Callback):
         # Threading support
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.pending_futures = []
+        
+        # Track current epoch
+        self.current_epoch = 0
 
     def on_train_begin(self, logs=None):
         self.step_counter = 0
         self.pending_futures = []
+        self.current_epoch = 0
+    
+    def on_epoch_begin(self, epoch, logs=None):
+        self.current_epoch = epoch
 
     def on_batch_end(self, batch, logs=None):
         self.step_counter += 1
@@ -248,6 +266,7 @@ class FisherTraceCallback(tf.keras.callbacks.Callback):
             # Submit async computation
             future = self.executor.submit(
                 self._compute_fisher_async,
+                self.current_epoch,
                 self.step_counter
             )
             self.pending_futures.append(future)
@@ -255,11 +274,11 @@ class FisherTraceCallback(tf.keras.callbacks.Callback):
             # Clean up completed futures
             self.pending_futures = [f for f in self.pending_futures if not f.done()]
 
-    def _compute_fisher_async(self, step_counter):
+    def _compute_fisher_async(self, epoch, step_counter):
         """Compute Fisher trace asynchronously in a separate thread"""
         try:
             fisher_trace_a = self.compute_fisher_trace_tf()
-            log_and_flush(self.logger, f"Step {step_counter}: Fisher Trace (Val Set A) = {fisher_trace_a.numpy():.6f}")
+            log_and_flush(self.logger, f"Epoch {epoch + 1}, Step {step_counter}: Fisher Trace (Val Set A) = {fisher_trace_a.numpy():.6f}")
         except Exception as e:
             self.logger.error(f"Error in async Fisher trace computation: {e}")
 
@@ -309,7 +328,7 @@ class FisherTraceCallback(tf.keras.callbacks.Callback):
 class ActivationSaturationCallback(tf.keras.callbacks.Callback):
     """Monitor ReLU activation saturation - OPTIMIZED WITH ASYNC"""
     
-    def __init__(self, val_dataset, epsilon=1e-3, log_dir='logs', num_batches=5, batch_size=32, max_workers=2):
+    def __init__(self, val_dataset, n_steps=100, epsilon=1e-3, log_dir='logs', num_batches=3, batch_size=32, max_workers=2):
         super(ActivationSaturationCallback, self).__init__()
         # Pre-batch, cache, repeat, and prefetch the dataset for optimal performance
         self.val_dataset = (val_dataset
@@ -318,6 +337,7 @@ class ActivationSaturationCallback(tf.keras.callbacks.Callback):
                            .cache()
                            .repeat()
                            .prefetch(tf.data.AUTOTUNE))
+        self.n_steps = n_steps
         self.epsilon = tf.constant(epsilon, dtype=tf.float32)
         self.log_dir = log_dir
         self.num_batches = num_batches
@@ -328,32 +348,51 @@ class ActivationSaturationCallback(tf.keras.callbacks.Callback):
         # Threading support
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.pending_futures = []
+        
+        # Track current epoch and step counter
+        self.current_epoch = 0
+        self.step_counter = 0
+        
+        # Cache ReLU layers
+        self.relu_layers = []
 
-    def on_epoch_end(self, epoch, logs=None):
-        relu_layers = []
+    def on_train_begin(self, logs=None):
+        self.step_counter = 0
+        self.pending_futures = []
+        self.current_epoch = 0
+        
+        # Identify ReLU layers once at the start
+        self.relu_layers = []
         for layer in self.model.layers:
             if hasattr(layer, 'activation') and layer.activation is not None:
                 activation_name = layer.activation.__name__ if hasattr(layer.activation, '__name__') else str(layer.activation)
                 if 'relu' in activation_name.lower():
-                    relu_layers.append(layer)
-        
-        # Submit async computation for all ReLU layers
-        for layer in relu_layers:
-            future = self.executor.submit(
-                self._compute_saturation_async,
-                epoch,
-                layer
-            )
-            self.pending_futures.append(future)
-        
-        # Clean up completed futures
-        self.pending_futures = [f for f in self.pending_futures if not f.done()]
+                    self.relu_layers.append(layer)
+    
+    def on_epoch_begin(self, epoch, logs=None):
+        self.current_epoch = epoch
 
-    def _compute_saturation_async(self, epoch, layer):
+    def on_batch_end(self, batch, logs=None):
+        self.step_counter += 1
+        if self.step_counter % self.n_steps == 0:
+            # Submit async computation for all ReLU layers
+            for layer in self.relu_layers:
+                future = self.executor.submit(
+                    self._compute_saturation_async,
+                    self.current_epoch,
+                    self.step_counter,
+                    layer
+                )
+                self.pending_futures.append(future)
+            
+            # Clean up completed futures
+            self.pending_futures = [f for f in self.pending_futures if not f.done()]
+
+    def _compute_saturation_async(self, epoch, step_counter, layer):
         """Compute saturation asynchronously in a separate thread"""
         try:
             saturation = self.compute_saturation_tf(layer)
-            log_and_flush(self.logger, f"Epoch {epoch + 1}: Layer {layer.name} ReLU Saturation = {saturation.numpy():.6f}")
+            log_and_flush(self.logger, f"Epoch {epoch + 1}, Step {step_counter}: Layer {layer.name} ReLU Saturation = {saturation.numpy():.6f}")
         except Exception as e:
             self.logger.error(f"Error in async saturation computation for layer {layer.name}: {e}")
 
@@ -411,16 +450,16 @@ class ActivationSaturationCallback(tf.keras.callbacks.Callback):
 # ============================================================================
 
 class TargetDomainGapCallback(tf.keras.callbacks.Callback):
-    """Track validation performance gap on target domain"""
+    """Track validation performance gap on target domain - OPTIMIZED WITH ASYNC + TF.FUNCTION"""
     
-    def __init__(self, val_dataset_b, n_steps=100, k_window=10, ema_alpha=0.9, log_dir='logs'):
+    def __init__(self, val_dataset_b, n_steps=100, k_window=10, ema_alpha=0.9, log_dir='logs', batch_size=32, max_workers=1):
         super(TargetDomainGapCallback, self).__init__()
-        self.val_dataset_b = val_dataset_b
+        self.val_dataset_b = val_dataset_b.batch(batch_size).take(5).cache().repeat().prefetch(tf.data.AUTOTUNE)  # Reduced batches
         self.n_steps = n_steps
         self.k_window = k_window
         self.ema_alpha = ema_alpha
         self.log_dir = log_dir
-        
+        self.batch_size = batch_size
         self.step_counter = 0
         self.best_loss_b = float('inf')
         self.loss_history = []
@@ -428,102 +467,197 @@ class TargetDomainGapCallback(tf.keras.callbacks.Callback):
         
         self.logger = get_logger('TargetGap', log_dir, 'domain_adaptation.log')
         self.loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
+        
+        # Threading support
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.pending_futures = []
+        self.lock = threading.Lock()
+        
+        # Track current epoch
+        self.current_epoch = 0
     
     def on_train_begin(self, logs=None):
         self.step_counter = 0
         self.best_loss_b = float('inf')
         self.loss_history = []
         self.ema_loss = None
-        #self.logger.info("=" * 60)
-        #self.logger.info("Target Domain Gap Tracking Started")
-        #self.logger.info("=" * 60)
+        self.current_epoch = 0
+        self.pending_futures = []
         log_and_flush(self.logger, "=" * 60)
         log_and_flush(self.logger, "Target Domain Gap Tracking Started")
         log_and_flush(self.logger, "=" * 60)
+    
+    def on_epoch_begin(self, epoch, logs=None):
+        self.current_epoch = epoch
     
     def on_batch_end(self, batch, logs=None):
         self.step_counter += 1
         
         if self.step_counter % self.n_steps == 0:
-            current_loss = self.compute_validation_loss(self.val_dataset_b)
+            # Submit async computation
+            future = self.executor.submit(
+                self._compute_gap_async,
+                self.current_epoch,
+                self.step_counter
+            )
+            self.pending_futures.append(future)
             
-            if current_loss < self.best_loss_b:
-                self.best_loss_b = current_loss
+            # Clean up completed futures
+            self.pending_futures = [f for f in self.pending_futures if not f.done()]
+    
+    def _compute_gap_async(self, epoch, step_counter):
+        """Compute target domain gap asynchronously in a separate thread"""
+        try:
+            current_loss = self.compute_validation_loss_tf()
             
-            self.loss_history.append(current_loss)
-            if len(self.loss_history) > self.k_window:
-                self.loss_history.pop(0)
+            # Thread-safe update of tracking variables
+            with self.lock:
+                if current_loss < self.best_loss_b:
+                    self.best_loss_b = current_loss
+                
+                self.loss_history.append(current_loss)
+                if len(self.loss_history) > self.k_window:
+                    self.loss_history.pop(0)
+                
+                if self.ema_loss is None:
+                    self.ema_loss = current_loss
+                else:
+                    self.ema_loss = (self.ema_alpha * self.ema_loss + 
+                                   (1 - self.ema_alpha) * current_loss)
+                
+                gap = current_loss - self.best_loss_b
+                best_loss_snapshot = self.best_loss_b
+                ema_loss_snapshot = self.ema_loss
             
-            if self.ema_loss is None:
-                self.ema_loss = current_loss
-            else:
-                self.ema_loss = (self.ema_alpha * self.ema_loss + 
-                               (1 - self.ema_alpha) * current_loss)
-            
-            gap = current_loss - self.best_loss_b
-            
-            #self.logger.info(
             log_and_flush(self.logger, 
-                f"Step {self.step_counter}: "
+                f"Epoch {epoch + 1}, Step {step_counter}: "
                 f"Loss_B={current_loss:.4f}, "
-                f"Best={self.best_loss_b:.4f}, "
-                f"EMA={self.ema_loss:.4f}, "
+                f"Best={best_loss_snapshot:.4f}, "
+                f"EMA={ema_loss_snapshot:.4f}, "
                 f"Gap={gap:.4f}"
             )
+        except Exception as e:
+            self.logger.error(f"Error in async target domain gap computation: {e}")
     
-    def compute_validation_loss(self, dataset):
+    def on_train_end(self, logs=None):
+        """Wait for all pending computations and cleanup"""
+        log_and_flush(self.logger, "Waiting for pending target domain gap computations...")
+        for future in self.pending_futures:
+            try:
+                future.result(timeout=60)
+            except Exception as e:
+                self.logger.error(f"Error waiting for async task: {e}")
+        self.executor.shutdown(wait=True)
+        log_and_flush(self.logger, "Target domain gap cleanup complete")
+    
+    @tf.function  # JIT compile for speed
+    def _compute_batch_loss(self, images, labels):
+        """Compute loss for a single batch"""
+        logits = self.model(images, training=False)
+        return self.loss_fn(labels, logits)
+    
+    def compute_validation_loss_tf(self):
+        """Compute validation loss using TensorFlow operations"""
         losses = []
-        for images, labels in dataset:
-            logits = self.model(images, training=False)
-            loss = self.loss_fn(labels, logits)
+        batch_count = 0
+        for images, labels in self.val_dataset_b:
+            if batch_count >= 5:  # Reduced from 10
+                break
+            loss = self._compute_batch_loss(images, labels)
             losses.append(float(loss))
+            batch_count += 1
         return np.mean(losses) if losses else 0.0
 
 
 class EntropyGapCallback(tf.keras.callbacks.Callback):
-    """Measure entropy difference between source and target domains"""
+    """Measure entropy difference between source and target domains - OPTIMIZED WITH ASYNC + TF.FUNCTION"""
     
-    def __init__(self, dataset_a_subset, dataset_b_subset, n_steps=100, batch_size=32, log_dir='logs'):
+    def __init__(self, dataset_a_subset, dataset_b_subset, n_steps=100, batch_size=32, log_dir='logs', max_workers=1):
         super(EntropyGapCallback, self).__init__()
-        self.dataset_a_subset = dataset_a_subset
-        self.dataset_b_subset = dataset_b_subset
+        self.dataset_a_subset = dataset_a_subset.batch(batch_size).take(5).cache().repeat().prefetch(tf.data.AUTOTUNE)  # Reduced batches
+        self.dataset_b_subset = dataset_b_subset.batch(batch_size).take(5).cache().repeat().prefetch(tf.data.AUTOTUNE)  # Reduced batches
         self.n_steps = n_steps
         self.batch_size = batch_size
         self.log_dir = log_dir
         
         self.step_counter = 0
         self.logger = get_logger('EntropyGap', log_dir, 'domain_adaptation.log')
+        
+        # Threading support
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.pending_futures = []
+        
+        # Track current epoch
+        self.current_epoch = 0
     
     def on_train_begin(self, logs=None):
         self.step_counter = 0
-        #self.logger.info("=" * 60)
-        #self.logger.info("Entropy Gap Tracking Started")
-        #self.logger.info("=" * 60)
+        self.current_epoch = 0
+        self.pending_futures = []
         log_and_flush(self.logger, "=" * 60)
         log_and_flush(self.logger, "Entropy Gap Tracking Started")
         log_and_flush(self.logger, "=" * 60)
+    
+    def on_epoch_begin(self, epoch, logs=None):
+        self.current_epoch = epoch
     
     def on_batch_end(self, batch, logs=None):
         self.step_counter += 1
         
         if self.step_counter % self.n_steps == 0:
-            entropy_a = self.compute_entropy_dataset(self.dataset_a_subset)
-            entropy_b = self.compute_entropy_dataset(self.dataset_b_subset)
+            # Submit async computation
+            future = self.executor.submit(
+                self._compute_entropy_gap_async,
+                self.current_epoch,
+                self.step_counter
+            )
+            self.pending_futures.append(future)
+            
+            # Clean up completed futures
+            self.pending_futures = [f for f in self.pending_futures if not f.done()]
+    
+    def _compute_entropy_gap_async(self, epoch, step_counter):
+        """Compute entropy gap asynchronously in a separate thread"""
+        try:
+            entropy_a = self.compute_entropy_dataset_tf(self.dataset_a_subset)
+            entropy_b = self.compute_entropy_dataset_tf(self.dataset_b_subset)
             gap = entropy_b - entropy_a
             
-            #self.logger.info(
             log_and_flush(self.logger, 
-                f"Step {self.step_counter}: "
+                f"Epoch {epoch + 1}, Step {step_counter}: "
                 f"H_A={entropy_a:.4f}, "
                 f"H_B={entropy_b:.4f}, "
                 f"Gap={gap:.4f}"
             )
+        except Exception as e:
+            self.logger.error(f"Error in async entropy gap computation: {e}")
     
-    def compute_entropy_dataset(self, dataset):
+    def on_train_end(self, logs=None):
+        """Wait for all pending computations and cleanup"""
+        log_and_flush(self.logger, "Waiting for pending entropy gap computations...")
+        for future in self.pending_futures:
+            try:
+                future.result(timeout=60)
+            except Exception as e:
+                self.logger.error(f"Error waiting for async task: {e}")
+        self.executor.shutdown(wait=True)
+        log_and_flush(self.logger, "Entropy gap cleanup complete")
+    
+    @tf.function  # JIT compile for speed
+    def _get_predictions(self, images):
+        """Get model predictions"""
+        return self.model(images, training=False)
+    
+    def compute_entropy_dataset_tf(self, dataset):
+        """Compute entropy using TF operations where possible"""
         all_logits = []
+        batch_count = 0
         for images, _ in dataset:
-            logits = self.model(images, training=False)
+            if batch_count >= 5:  # Reduced from 10
+                break
+            logits = self._get_predictions(images)
             all_logits.append(logits.numpy())
+            batch_count += 1
         
         if not all_logits:
             return 0.0
@@ -533,13 +667,13 @@ class EntropyGapCallback(tf.keras.callbacks.Callback):
 
 
 class RepresentationMismatchCallback(tf.keras.callbacks.Callback):
-    """Measure distribution distance between domains at multiple layers"""
+    """Measure distribution distance between domains at multiple layers - OPTIMIZED WITH ASYNC + CACHING"""
     
     def __init__(self, dataset_a_subset, dataset_b_subset, n_steps=100, 
-                 batch_size=32, mmd_kernel='rbf', mmd_gamma=1.0, log_dir='logs'):
+                 batch_size=32, mmd_kernel='rbf', mmd_gamma=1.0, log_dir='logs', max_workers=2):
         super(RepresentationMismatchCallback, self).__init__()
-        self.dataset_a_subset = dataset_a_subset
-        self.dataset_b_subset = dataset_b_subset
+        self.dataset_a_subset = dataset_a_subset.batch(batch_size).take(5).cache().repeat().prefetch(tf.data.AUTOTUNE)  # Reduced batches
+        self.dataset_b_subset = dataset_b_subset.batch(batch_size).take(5).cache().repeat().prefetch(tf.data.AUTOTUNE)  # Reduced batches
         self.n_steps = n_steps
         self.batch_size = batch_size
         self.mmd_kernel = mmd_kernel
@@ -551,42 +685,78 @@ class RepresentationMismatchCallback(tf.keras.callbacks.Callback):
         self.layer_names = {}
         
         self.logger = get_logger('RepMismatch', log_dir, 'domain_adaptation.log')
+        
+        # Threading support
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.pending_futures = []
+        
+        # Track current epoch
+        self.current_epoch = 0
     
     def on_train_begin(self, logs=None):
         self.step_counter = 0
+        self.current_epoch = 0
+        self.pending_futures = []
         self.identify_layer_positions()
         self.create_intermediate_models()
         
-        #self.logger.info("=" * 60)
-        #self.logger.info("Representation Mismatch Tracking Started")
-        #self.logger.info(f"Monitoring layers: {list(self.layer_names.values())}")
-        #self.logger.info("=" * 60)
         log_and_flush(self.logger, "=" * 60)
         log_and_flush(self.logger, "Representation Mismatch Tracking Started")
         log_and_flush(self.logger, f"Monitoring layers: {list(self.layer_names.values())}")
         log_and_flush(self.logger, "=" * 60)
     
+    def on_epoch_begin(self, epoch, logs=None):
+        self.current_epoch = epoch
+    
     def on_batch_end(self, batch, logs=None):
         self.step_counter += 1
         
         if self.step_counter % self.n_steps == 0:
-            #self.logger.info(f"Step {self.step_counter} - Computing representation distances...")
-            log_and_flush(self.logger, f"Step {self.step_counter} - Computing representation distances...")
+            log_and_flush(self.logger, f"Epoch {self.current_epoch + 1}, Step {self.step_counter} - Computing representation distances...")
             
+            # Submit async computation for each layer
             for position, layer_name in self.layer_names.items():
-                embeddings_a = self.extract_embeddings(self.dataset_a_subset, position)
-                embeddings_b = self.extract_embeddings(self.dataset_b_subset, position)
-                
-                mmd = compute_mmd(embeddings_a, embeddings_b, 
-                                 kernel=self.mmd_kernel, gamma=self.mmd_gamma)
-                kl = compute_kl_divergence(embeddings_a, embeddings_b)
-                wasserstein = compute_wasserstein_distance(embeddings_a, embeddings_b)
-                
-                #self.logger.info(
-                log_and_flush(self.logger, 
-                    f"  Layer={layer_name} ({position}): "
-                    f"MMD={mmd:.4f}, KL={kl:.4f}, Wasserstein={wasserstein:.4f}"
+                future = self.executor.submit(
+                    self._compute_mismatch_async,
+                    self.current_epoch,
+                    self.step_counter,
+                    position,
+                    layer_name
                 )
+                self.pending_futures.append(future)
+            
+            # Clean up completed futures
+            self.pending_futures = [f for f in self.pending_futures if not f.done()]
+    
+    def _compute_mismatch_async(self, epoch, step_counter, position, layer_name):
+        """Compute representation mismatch asynchronously in a separate thread"""
+        try:
+            embeddings_a = self.extract_embeddings_tf(self.dataset_a_subset, position)
+            embeddings_b = self.extract_embeddings_tf(self.dataset_b_subset, position)
+            
+            # Use optimized distance metrics
+            mmd = compute_mmd(embeddings_a, embeddings_b, 
+                             kernel=self.mmd_kernel, gamma=self.mmd_gamma)
+            kl = compute_kl_divergence(embeddings_a, embeddings_b)
+            wasserstein = compute_wasserstein_distance(embeddings_a, embeddings_b)
+            
+            log_and_flush(self.logger, 
+                f"  Epoch {epoch + 1}, Layer={layer_name} ({position}): "
+                f"MMD={mmd:.4f}, KL={kl:.4f}, Wasserstein={wasserstein:.4f}"
+            )
+        except Exception as e:
+            self.logger.error(f"Error in async representation mismatch computation for layer {layer_name}: {e}")
+    
+    def on_train_end(self, logs=None):
+        """Wait for all pending computations and cleanup"""
+        log_and_flush(self.logger, "Waiting for pending representation mismatch computations...")
+        for future in self.pending_futures:
+            try:
+                future.result(timeout=60)
+            except Exception as e:
+                self.logger.error(f"Error waiting for async task: {e}")
+        self.executor.shutdown(wait=True)
+        log_and_flush(self.logger, "Representation mismatch cleanup complete")
     
     def identify_layer_positions(self):
         weighted_layers = [
@@ -611,14 +781,21 @@ class RepresentationMismatchCallback(tf.keras.callbacks.Callback):
                 outputs=layer.output
             )
     
-    def extract_embeddings(self, dataset, position):
+    def extract_embeddings_tf(self, dataset, position):
+        """Extract embeddings using cached intermediate models"""
         embeddings = []
+        batch_count = 0
+        intermediate_model = self.intermediate_models[position]
+        
         for images, _ in dataset:
-            layer_output = self.intermediate_models[position](images, training=False)
+            if batch_count >= 5:  # Reduced from 10
+                break
+            layer_output = intermediate_model(images, training=False)
             if len(layer_output.shape) > 2:
                 batch_size = tf.shape(layer_output)[0]
                 layer_output = tf.reshape(layer_output, [batch_size, -1])
             embeddings.append(layer_output.numpy())
+            batch_count += 1
         
         if not embeddings:
             return np.array([])
@@ -713,10 +890,11 @@ class CallbackFactory:
             max_workers=max_workers
         )
     
-    def create_activation_saturation(self, val_dataset, epsilon=1e-3, log_dir='logs', max_workers=2):
+    def create_activation_saturation(self, val_dataset, n_steps=100, epsilon=1e-3, log_dir='logs', max_workers=2):
         """Create ActivationSaturationCallback"""
         return ActivationSaturationCallback(
             val_dataset=val_dataset,
+            n_steps=n_steps,
             epsilon=epsilon,
             log_dir=log_dir,
             max_workers=max_workers
@@ -727,30 +905,33 @@ class CallbackFactory:
     # ------------------------------------------------------------------------
     
     def create_target_domain_gap(self, val_dataset_b, n_steps=100, k_window=10, 
-                                ema_alpha=0.9, log_dir='logs'):
+                                ema_alpha=0.9, log_dir='logs', batch_size=32, max_workers=1):
         """Create TargetDomainGapCallback"""
         return TargetDomainGapCallback(
             val_dataset_b=val_dataset_b,
             n_steps=n_steps,
             k_window=k_window,
             ema_alpha=ema_alpha,
-            log_dir=log_dir
+            batch_size=batch_size,
+            log_dir=log_dir,
+            max_workers=max_workers
         )
     
     def create_entropy_gap(self, dataset_a_subset, dataset_b_subset, n_steps=100, 
-                          batch_size=32, log_dir='logs'):
+                          batch_size=32, log_dir='logs', max_workers=1):
         """Create EntropyGapCallback"""
         return EntropyGapCallback(
             dataset_a_subset=dataset_a_subset,
             dataset_b_subset=dataset_b_subset,
             n_steps=n_steps,
             batch_size=batch_size,
-            log_dir=log_dir
+            log_dir=log_dir,
+            max_workers=max_workers
         )
     
     def create_representation_mismatch(self, dataset_a_subset, dataset_b_subset, 
                                       n_steps=100, batch_size=32, mmd_kernel='rbf', 
-                                      mmd_gamma=1.0, log_dir='logs'):
+                                      mmd_gamma=1.0, log_dir='logs', max_workers=2):
         """Create RepresentationMismatchCallback"""
         return RepresentationMismatchCallback(
             dataset_a_subset=dataset_a_subset,
@@ -759,7 +940,8 @@ class CallbackFactory:
             batch_size=batch_size,
             mmd_kernel=mmd_kernel,
             mmd_gamma=mmd_gamma,
-            log_dir=log_dir
+            log_dir=log_dir,
+            max_workers=max_workers
         )
     
     # ------------------------------------------------------------------------
@@ -772,16 +954,35 @@ class CallbackFactory:
         
         Args:
             val_dataset: Validation dataset
-            test_dataset: Test dataset
             log_dir: Directory for logs
         
         Returns:
             List of convergence monitoring callbacks
         """
+        training_config = self.config.get('training', {})
+        batch_size = training_config.get('batch_size', 32)
+        max_workers = training_config.get('max_workers', 6)
+        
+        # Distribute workers proportionally: [2, 1, 2] when max_workers >= 5
+        # Each callback gets at least 1 worker
+        total_weights = 5  # 2 + 1 + 2
+        num_callbacks = 3
+        
+        if max_workers < num_callbacks:
+            # Not enough workers, give 1 to each
+            workers_gradient = 1
+            workers_fisher = 1
+            workers_activation = 1
+        else:
+            # Distribute proportionally
+            workers_gradient = max(1, int(max_workers * 2 / total_weights))
+            workers_fisher = max(1, int(max_workers * 1 / total_weights))
+            workers_activation = max(1, max_workers - workers_gradient - workers_fisher)
+        
         return [
-            self.create_gradient_analysis(log_dir=log_dir, K=50, ema_alpha=0.99),
-            self.create_fisher_trace(val_dataset, n_steps=100, log_dir=log_dir),
-            self.create_activation_saturation(val_dataset, epsilon=1e-3, log_dir=log_dir)
+            self.create_gradient_analysis(log_dir=log_dir, K=50, ema_alpha=0.99, max_workers=workers_gradient),
+            self.create_fisher_trace(val_dataset, n_steps=100, log_dir=log_dir, max_workers=workers_fisher),
+            self.create_activation_saturation(val_dataset, n_steps=100, epsilon=1e-3, log_dir=log_dir, max_workers=workers_activation)
         ]
     
     def create_all_domain_adaptation_callbacks(self, dataset_a_subset, dataset_b_subset, 
@@ -799,6 +1000,25 @@ class CallbackFactory:
             List of domain adaptation callbacks
         """
         da_config = self.config.get('domain_adaptation', {})
+        training_config = self.config.get('training', {})
+        batch_size = training_config.get('batch_size', 32)
+        max_workers = training_config.get('max_workers', 6)
+        
+        # Distribute workers proportionally: [1, 1, 2] when max_workers >= 4
+        # Each callback gets at least 1 worker
+        total_weights = 4  # 1 + 1 + 2
+        num_callbacks = 3
+        
+        if max_workers < num_callbacks:
+            # Not enough workers, give 1 to each
+            workers_target_gap = 1
+            workers_entropy_gap = 1
+            workers_repr_mismatch = 1
+        else:
+            # Distribute proportionally
+            workers_target_gap = max(1, int(max_workers * 1 / total_weights))
+            workers_entropy_gap = max(1, int(max_workers * 1 / total_weights))
+            workers_repr_mismatch = max(1, max_workers - workers_target_gap - workers_entropy_gap)
         
         return [
             self.create_target_domain_gap(
@@ -806,28 +1026,32 @@ class CallbackFactory:
                 n_steps=n_steps,
                 k_window=da_config.get('target_gap', {}).get('k_window', 10),
                 ema_alpha=da_config.get('target_gap', {}).get('ema_alpha', 0.9),
-                log_dir=log_dir
+                batch_size=batch_size,
+                log_dir=log_dir,
+                max_workers=workers_target_gap
             ),
             self.create_entropy_gap(
                 dataset_a_subset=dataset_a_subset,
                 dataset_b_subset=dataset_b_subset,
                 n_steps=n_steps,
-                batch_size=da_config.get('entropy_gap', {}).get('batch_size', 32),
-                log_dir=log_dir
+                batch_size=batch_size,
+                log_dir=log_dir,
+                max_workers=workers_entropy_gap
             ),
             self.create_representation_mismatch(
                 dataset_a_subset=dataset_a_subset,
                 dataset_b_subset=dataset_b_subset,
                 n_steps=n_steps,
-                batch_size=da_config.get('representation_mismatch', {}).get('batch_size', 32),
+                batch_size=batch_size,
                 mmd_kernel=da_config.get('representation_mismatch', {}).get('mmd_kernel', 'rbf'),
                 mmd_gamma=da_config.get('representation_mismatch', {}).get('mmd_gamma', 1.0),
-                log_dir=log_dir
+                log_dir=log_dir,
+                max_workers=workers_repr_mismatch
             )
         ]
     
     def create_standard_callbacks(self, checkpoint_path='checkpoints/best_model.h5',
-                                  monitor='val_accuracy', patience=10):
+                                  monitor='val_accuracy', patience=10, log_dir='logs'):
         """
         Create standard training callbacks (checkpoint, early stopping, tensorboard, metrics logging)
         
@@ -835,12 +1059,13 @@ class CallbackFactory:
             checkpoint_path: Path to save best model
             monitor: Metric to monitor for checkpoint/early stopping
             patience: Patience for early stopping
+            log_dir: Directory for logs
         
         Returns:
             List of standard callbacks
         """
         return [
-            self.create_training_metrics_logger(log_dir='logs'),
+            self.create_training_metrics_logger(log_dir=log_dir),
             self.create_checkpoint(
                 filepath=checkpoint_path,
                 monitor=monitor,
@@ -854,7 +1079,7 @@ class CallbackFactory:
                 restore_best_weights=True
             ),
             self.create_tensorboard(
-                log_dir='logs/tensorboard',
+                log_dir=os.path.join(log_dir, 'tensorboard'),
                 histogram_freq=1
             )
         ]

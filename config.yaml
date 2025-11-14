@@ -48,19 +48,20 @@ models:
     final_activation: 'softmax'
     
 training:
-  epochs: 50
-  batch_size: 64
+  epochs: 100
+  batch_size: 64  # Single batch size used throughout training and callbacks
   optimizer: 'adam'
   learning_rate: 0.001
-  train_split: 0.7
-  val_split: 0.15
-  test_split: 0.15
-  early_stopping_patience: 3
+  train_split: 0.6
+  val_split: 0.2
+  test_split: 0.2
+  early_stopping_patience: 5
+  max_workers: 12  # Total number of workers for asynchronous callbacks
 
 domain_adaptation:
-  enabled: false  # Set to true to enable domain adaptation tracking
+  enabled: true  # Set to true to enable domain adaptation tracking
   subset_size: 500  # Number of samples to hold out from each domain for DA metrics
-  n_steps: 100  # Compute DA metrics every N training steps
+  n_steps: 500  # INCREASED: Compute DA metrics every 500 training steps (was 100) for much less overhead
   
   # Target Domain Gap tracking
   target_gap:
@@ -68,12 +69,10 @@ domain_adaptation:
     ema_alpha: 0.9  # Exponential moving average smoothing factor
   
   # Entropy Gap tracking
-  entropy_gap:
-    batch_size: 64  # Batch size for entropy computation
+  entropy_gap: {}
   
   # Representation Mismatch tracking
   representation_mismatch:
-    batch_size: 64  # Batch size for representation extraction
     mmd_kernel: 'rbf'  # Kernel type for MMD: 'rbf' or 'linear'
     mmd_gamma: 1.0  # Bandwidth parameter for RBF kernel
 
